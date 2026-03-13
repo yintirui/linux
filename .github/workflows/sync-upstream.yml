@@ -1,0 +1,25 @@
+name: Sync Upstream
+on:
+  schedule:
+    # 每天北京时间凌晨 4 点 (UTC 20:00) 自动执行
+    - cron:  '0 20 * * *'
+  workflow_dispatch: # 允许你随时在网页上点按钮手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Sync upstream changes
+        id: sync
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        with:
+          upstream_sync_repo: torvalds/linux
+          upstream_sync_branch: master
+          target_sync_branch: master
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          test_mode: false
