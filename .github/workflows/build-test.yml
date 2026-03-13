@@ -1,0 +1,42 @@
+name: Cross-Arch Kernel Build Test
+
+on:
+  push:
+    branches:
+      - 'dev-**'
+
+jobs:
+  build:
+    # 矩阵策略：同时在两个独立的云端服务器上分别编译 x86 和 ARM64
+    strategy:
+      matrix:
+        arch: [x86_64, arm64]
+        include:
+          - arch: x86_64
+            compiler: gcc
+            cross_compile: ''
+          - arch: arm64
+            compiler: gcc-aarch64-linux-gnu
+            cross_compile: aarch64-linux-gnu-
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev ${{ matrix.compiler }}
+
+      - name: Configure Kernel (defconfig)
+        run: |
+          make ARCH=${{ matrix.arch }} CROSS_COMPILE=${{ matrix.cross_compile }} defconfig
+          # 因为你在搞 MM，也可以开启一些特定的内存调试选项，这里简单起见用 defconfig
+
+      - name: Build Kernel (bzImage / Image)
+        run: |
+          echo "Building for ${{ matrix.arch }}..."
+          # 用满 GitHub Actions 的双核 CPU 编译
+          make ARCH=${{ matrix.arch }} CROSS_COMPILE=${{ matrix.cross_compile }} -j$(nproc)
