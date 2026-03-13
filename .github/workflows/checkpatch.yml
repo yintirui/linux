@@ -1,0 +1,38 @@
+name: Kernel Checkpatch
+
+# 当 push 代码到任何以 "dev-" 或 "patch-" 开头的分支时触发
+on:
+  push:
+    branches:
+      - 'dev-**'
+      - 'patch-**'
+
+jobs:
+  checkpatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 获取完整历史，以便对比 commit
+
+      - name: Run checkpatch.pl on new commits
+        run: |
+          echo "Starting checkpatch for newly pushed commits..."
+          # 获取当前分支相对于 master 的所有新 commits
+          COMMITS=$(git rev-list origin/master..HEAD)
+          
+          if [ -z "$COMMITS" ]; then
+            echo "No new commits to check."
+            exit 0
+          fi
+
+          # 遍历每一个 commit，用 checkpatch 检查
+          for COMMIT in $COMMITS; do
+            echo "========================================"
+            echo "Checking commit: $COMMIT"
+            git log -1 --format="%s" $COMMIT
+            # 将 commit 转成 patch 格式并通过管道喂给 checkpatch.pl
+            git format-patch -1 $COMMIT --stdout | ./scripts/checkpatch.pl - || exit 1
+          done
+          echo "All checkpatch passed perfectly! You are good to send emails."
