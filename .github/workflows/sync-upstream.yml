@@ -1,25 +1,46 @@
-name: Sync Upstream
+name: Sync Upstream (Raw Git)
+
 on:
   schedule:
-    # 每天北京时间凌晨 4 点 (UTC 20:00) 自动执行
-    - cron:  '0 20 * * *'
-  workflow_dispatch: # 允许你随时在网页上点按钮手动触发
+    # 每天的每个小时的第 0 分钟执行一次 (即每 1 小时同步一次)
+    - cron:  '0 * * * *'
+  workflow_dispatch: # 允许网页端手动点击触发
+
+# 设置全局环境变量，强制使用 Node.js 24，彻底干掉烦人的废弃警告
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    # 核心修复：赋予当前 Action 推送代码的写入权限！没有这个必定报 128 错误！
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout target repo
         uses: actions/checkout@v4
         with:
           ref: master
-          fetch-depth: 0
-      - name: Sync upstream changes
-        id: sync
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
-        with:
-          upstream_sync_repo: torvalds/linux
-          upstream_sync_branch: master
-          target_sync_branch: master
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-          test_mode: false
+          fetch-depth: 0 # Linux 仓库极大，我们需要完整历史以防错乱
+
+      - name: Configure Git Identity
+        run: |
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+
+      - name: Sync Torvalds Mainline (Native Git)
+        run: |
+          echo "=> 1. 添加 Linus 官方远程源..."
+          git remote add torvalds https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+
+          echo "=> 2. 从官方抓取最新 master..."
+          # 只抓取 master 分支，节省 GitHub 服务器的带宽和时间
+          git fetch torvalds master
+
+          echo "=> 3. 强行推送到个人的 master 分支..."
+          # 直接把抓取到的头指针 (FETCH_HEAD) 强推到我们 GitHub 的 master
+          git push origin FETCH_HEAD:refs/heads/master --force
+
+          echo "=> 4. 同步完美结束！"
+
