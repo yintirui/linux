@@ -152,3 +152,4 @@ obj-$(CONFIG_TMPFS_QUOTA) += shmem_quota.o
 obj-$(CONFIG_LAZY_MMU_MODE_KUNIT_TEST) += tests/lazy_mmu_mode_kunit.o
 obj-y += dummy_pfn_drv.o
 obj-y += dummy_fault_drv.o
+obj-y += vfio_mock_drv.o
