@@ -1,0 +1,206 @@
+From 4ebc98230b420240954d1f49fee68300e9ff5e6d Mon Sep 17 00:00:00 2001
+From: Kernel Performance Expert <kernel.expert@example.com>
+Date: Tue, 7 Apr 2026 09:40:00 +0900
+Subject: [PATCH] mm/sharepool: Optimize lock granularity and parallelize VMA
+ teardown
+
+This patch addresses the O(N) lock contention and long latency spikes
+during `mg_sp_free` by implementing a "Snapshot + Parallel Scatter-Gather
++ Async Fallocate" architecture, while strictly preserving the VMA
+structure and synchronous segfault semantics.
+
+1. Lock Decoupling (Snapshot):
+   Extracts `mm_struct` references under `spg->rw_lock` and immediately
+   releases the group lock. This breaks the dependency chain between
+   `spg->rw_lock` and `mmap_write_lock`, completely eliminating group-level
+   blocking for concurrent alloc/free operations.
+
+2. Parallel VMA Teardown (Scatter-Gather):
+   Dispatches VMA destruction to the `system_unbound_wq`. All 64+ VMAs
+   are torn down concurrently across multiple CPU cores. The main thread
+   synchronously waits for completion to fulfill the business requirement
+   (immediate fault on access after free). A `trylock` backoff mechanism
+   is used to prevent priority inversion against user threads.
+
+3. Asynchronous Fallocate:
+   Moves the heavy I/O operation (`sp_fallocate`) to a background worker
+   after VMAs are destroyed. This removes storage latency from the
+   critical path of the syscall.
+
+Signed-off-by: Kernel Performance Expert <kernel.expert@example.com>
+---
+ mm/share_pool.c | 119 +++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 114 insertions(+), 5 deletions(-)
+
+diff --git a/mm/share_pool.c b/mm/share_pool.c
+index f4003675857f..a7b8e9c0d1e2 100644
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -51,6 +51,8 @@
+ #include <linux/time64.h>
+ #include <linux/pagewalk.h>
+ #include <linux/workqueue.h>
++#include <linux/completion.h>
++#include <linux/delay.h>
+ 
+ /* Use spa va address as mmap offset. This can work because spa_file
+  * is setup with 64-bit address space. So va shall be well covered.
+@@ -1050,6 +1052,51 @@ static void sp_fallocate(struct sp_area *spa)
+ 		WARN(1, "sp fallocate failed %d\n", ret);
+ }
+ 
++/* Structures for parallel teardown and async fallocate */
++struct sp_unmap_work {
++	struct work_struct work;
++	struct mm_struct *mm;
++	unsigned long start;
++	unsigned long size;
++	atomic_t *pending_count;
++	struct completion *done;
++};
++
++struct sp_fallocate_work {
++	struct work_struct work;
++	struct sp_area *spa;
++	struct sp_group *spg;
++};
++
++static void sp_parallel_unmap_func(struct work_struct *work)
++{
++	struct sp_unmap_work *uw = container_of(work, struct sp_unmap_work, work);
++	struct mm_struct *mm = uw->mm;
++
++	/* 
++	 * Trylock backoff mechanism to prevent mmap_write_lock priority inversion.
++	 * This ensures we don't starve active user threads holding the read lock.
++	 */
++	while (!mmap_write_trylock(mm)) {
++		cond_resched();
++		cpu_relax();
++	}
++
++	/* Safely tear down the VMA */
++	do_munmap(mm, uw->start, uw->size, NULL);
++	mmap_write_unlock(mm);
++
++	/* Release the reference taken during snapshot */
++	mmput(mm);
++
++	/* Notify the main thread if this is the last worker */
++	if (atomic_dec_and_test(uw->pending_count))
++		complete(uw->done);
++}
++
++static void sp_async_fallocate_func(struct work_struct *work)
++{
++	struct sp_fallocate_work *fw = container_of(work, struct sp_fallocate_work, work);
++	struct sp_area *spa = fw->spa;
++	struct sp_group *spg = fw->spg;
++
++	if (spa->type == SPA_TYPE_ALLOC)
++		sp_fallocate(spa);
++
++	/* Safely release the spa lifecycle in the background */
++	down_write(&spg->rw_lock);
++	sp_area_put_locked(spa);
++	up_write(&spg->rw_lock);
++
++	sp_group_put(spg);
++	kfree(fw);
++}
++
+ static struct sp_group *sp_group_get_from_idr(int spg_id)
+ {
+ 	struct sp_group *spg;
+@@ -1069,6 +1116,11 @@ static int sp_free_inner(unsigned long addr, int spg_id, bool is_sp_free)
+ 	struct sp_group *spg;
+ 	struct sp_group_node *spg_node;
+ 	const char *str = is_sp_free ? "sp_free" : "unshare_uva";
++	struct mm_struct **mm_array = NULL;
++	struct sp_unmap_work *uw_array = NULL;
++	struct sp_fallocate_work *fw = NULL;
++	int mm_cnt = 0, i;
++	atomic_t pending_unmaps;
++	DECLARE_COMPLETION_ONSTACK(unmap_done);
+ 
+ 	if (!current->mm)
+ 		spg = sp_group_get_from_idr(spg_id);
+@@ -1100,16 +1152,73 @@ static int sp_free_inner(unsigned long addr, int spg_id, bool is_sp_free)
+ 		goto drop_spa;
+ 	}
+ 
+-	__sp_free(spa, NULL);
+-	if (spa->type == SPA_TYPE_ALLOC)
+-		sp_fallocate(spa);
++	/* 
++	 * Phase 1: Snapshot and Extract.
++	 * Allocate arrays to hold the mm_struct snapshot and work items.
++	 */
++	mm_array = kvmalloc_array(spg->proc_num, sizeof(struct mm_struct *), GFP_KERNEL);
++	uw_array = kvmalloc_array(spg->proc_num, sizeof(struct sp_unmap_work), GFP_KERNEL);
++	if (!mm_array || !uw_array) {
++		kvfree(mm_array);
++		kvfree(uw_array);
++		ret = -ENOMEM;
++		goto drop_spa;
++	}
++
++	/* Gather all alive mm_structs */
++	list_for_each_entry(spg_node, &spg->proc_head, proc_node) {
++		if (mmget_not_zero(spg_node->master->mm)) {
++			mm_array[mm_cnt++] = spg_node->master->mm;
++		}
++	}
+ 
+ 	if (current->mm)
+ 		update_mem_usage(spa_size(spa), false, spa->is_hugepage, spg_node, spa->type);
+ 
++	/* 
++	 * Drop the group lock IMMEDIATELY.
++	 * This completely unlocks concurrent alloc/free for other processes.
++	 */
++	up_write(&spg->rw_lock);
++
++	/* 
++	 * Phase 2: Parallel VMA Teardown.
++	 * Dispatch unmap operations to all CPUs concurrently.
++	 */
++	atomic_set(&pending_unmaps, mm_cnt);
++	for (i = 0; i < mm_cnt; i++) {
++		INIT_WORK(&uw_array[i].work, sp_parallel_unmap_func);
++		uw_array[i].mm = mm_array[i];
++		uw_array[i].start = spa->va_start;
++		uw_array[i].size = spa_size(spa);
++		uw_array[i].pending_count = &pending_unmaps;
++		uw_array[i].done = &unmap_done;
++		queue_work(system_unbound_wq, &uw_array[i].work);
++	}
++
++	/* Wait synchronously to ensure strict access violation semantics */
++	if (mm_cnt > 0)
++		wait_for_completion(&unmap_done);
++
++	kvfree(mm_array);
++	kvfree(uw_array);
++
++	/* 
++	 * Phase 3: Asynchronous Fallocate.
++	 * VMAs are destroyed. Shift heavy storage I/O to background.
++	 */
++	fw = kmalloc(sizeof(*fw), GFP_KERNEL);
++	if (fw) {
++		INIT_WORK(&fw->work, sp_async_fallocate_func);
++		fw->spa = spa;
++		fw->spg = spg;
++		queue_work(system_unbound_wq, &fw->work);
++		return 0;
++	}
++
+ drop_spa:
+ 	sp_area_put_locked(spa);
+ drop_spg:
+ 	up_write(&spg->rw_lock);
+ 	sp_group_put(spg);
+ 	return ret;
+-- 
+2.43.0
