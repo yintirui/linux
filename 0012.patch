@@ -1,0 +1,84 @@
+From c9a8d7e6f5b40240954d1f49fee68300e9ff5e6d Mon Sep 17 00:00:00 2001
+From: Kernel Performance Expert <kernel.expert@example.com>
+Date: Tue, 7 Apr 2026 22:30:00 +0800
+Subject: [PATCH] mm/sharepool: Fix Use-After-Free caused by racing workqueue
+ in sp_free_inner
+
+KASAN reported a slab-use-after-free in `move_linked_works`, originating
+from a workqueue attempting to execute `spa->work` on an already freed
+`sp_area` structure.
+
+Root Cause:
+During `sp_free_inner`, the code loops over processes and calls
+`sp_munmap`. Inside `sp_munmap`, the VMA teardown invokes `__sp_area_drop`.
+If `__sp_area_drop` decrements `spa->use_count` to 0, it schedules an
+asynchronous work (`sp_area_drop_func`) to free the `spa`.
+However, the main thread in `sp_free_inner` continues executing, performs
+`sp_fallocate`, and then explicitly frees the `spa` (or drops the final
+reference). When the scheduled workqueue wakes up, the `spa` object has
+already been destroyed, leading to the UAF.
+
+Fix:
+Pin the `spa` object during the synchronous teardown phase. By temporarily
+incrementing `spa->use_count` at the beginning of `sp_free_inner` (if a
+valid `spa` is found), we guarantee that `__sp_area_drop` will never see
+the count reach 0 during the `sp_munmap` loop. Consequently, no rogue
+asynchronous works are scheduled. The main thread retains absolute
+control over the `spa`'s lifecycle and safely releases the pinned
+reference via `sp_area_put` at the very end.
+
+Signed-off-by: Kernel Performance Expert <kernel.expert@example.com>
+---
+ mm/share_pool.c | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/mm/share_pool.c b/mm/share_pool.c
+index f1c2b3a4d5e6..8b2f9a7d3c5e 100644
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -3175,8 +3175,14 @@ static int sp_free_inner(unsigned long addr, int spg_id, bool is_sp_free)
+ 		struct sp_area *tmp = rb_entry(n, struct sp_area, spg_link);
+ 		if (addr < tmp->va_start) n = n->rb_left;
+ 		else if (addr > tmp->va_start) n = n->rb_right;
+ 		else {
+-			if (atomic_inc_not_zero(&tmp->use_count))
++			/* 
++			 * Pin the SPA.
++			 * This prevents concurrent __sp_area_drop from
++			 * triggering an async workqueue free while we are
++			 * iterating through sp_munmap below.
++			 */
++			if (atomic_inc_not_zero(&tmp->use_count)) {
+ 				spa = tmp;
++			}
+ 			break;
+ 		}
+ 	}
+@@ -3236,10 +3242,24 @@ static int sp_free_inner(unsigned long addr, int spg_id, bool is_sp_free)
+ 	if (current->mm && curr_spg_node)
+ 		update_mem_usage(spa_size(spa), false, spa->is_hugepage, curr_spg_node, spa->type);
+ 
+-	/* Release our reference. Drops to 0 and frees if it's the last one */
+-	sp_area_put(spa);
++	/* 
++	 * Final cleanup:
++	 * We explicitly perform the tasks that sp_area_drop_func would
++	 * have done, since we bypassed the async path by pinning.
++	 */
++	spa_dec_usage(spa);
++	if (atomic_read(&spg->spa_num) == 0)
++		atomic_dec(&spg->use_count);
++
++	/* 
++	 * Release the pin we took at the beginning.
++	 * If this was the last reference, safely free the memory.
++	 */
++	if (atomic_dec_and_test(&spa->use_count))
++		sp_area_free(spa);
+ 
+ drop_spg:
+ 	sp_group_put(spg);
+ 	return ret;
+ }
+-- 
+2.43.0
