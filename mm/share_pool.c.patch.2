@@ -1,0 +1,313 @@
+From 4f738a9d12340240954d1f49fee68300e9ff5e6d Mon Sep 17 00:00:00 2001
+From: Kernel Performance Expert <kernel.expert@example.com>
+Date: Tue, 7 Apr 2026 11:30:00 +0800
+Subject: [PATCH] mm/sharepool: Optimize allocation path lock granularity
+
+This patch addresses the O(N) lock contention issue in the memory
+allocation path (`__mg_sp_alloc_nodemask`).
+
+Previously, the `spg->rw_lock` was held as a writer for the entire
+duration of mapping the newly allocated `spa` to all processes in
+the group. This included taking `mmap_write_lock` sequentially and
+calling `do_mm_populate`, which performs slow page allocations and
+I/O. Consequently, a single allocation would severely block all other
+memory operations within the same group.
+
+This patch implements a "Snapshot and Drop Lock" mechanism:
+1. Acquire `spg->rw_lock` (Write).
+2. Allocate and insert the `spa` into the RB-tree.
+3. Take a snapshot of all alive `mm_struct`s and their protections.
+4. Immediately release `spg->rw_lock`.
+5. Locklessly (w.r.t the group lock) iterate through the snapshot
+   and map the memory using standard `sp_map_spa_to_mm`.
+6. Re-acquire `spg->rw_lock` only to finalize usage statistics or
+   handle fallback rollbacks.
+
+This completely breaks the lock dependency chain between `spg->rw_lock`
+and `mmap_write_lock`, reducing the group lock hold time from O(N)
+to O(1) and maximizing allocation concurrency.
+
+Signed-off-by: Kernel Performance Expert <kernel.expert@example.com>
+---
+ mm/share_pool.c | 149 +++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 122 insertions(+), 27 deletions(-)
+
+diff --git a/mm/share_pool.c b/mm/share_pool.c
+index f4003675857f..3a1b5c9d6e8f 100644
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -2872,39 +2872,46 @@ static int sp_map_spa_to_mm(struct mm_struct *mm, struct sp_area *spa,
+ 	return ret;
+ }
+ 
+-static int sp_alloc_mmap_populate(struct sp_area *spa, struct sp_alloc_context *ac,
+-				  struct sp_group_node *spg_node)
++struct sp_map_target {
++	struct mm_struct *mm;
++	unsigned long prot;
++};
++
++static int sp_alloc_mmap_populate_lockless(struct sp_area *spa, struct sp_alloc_context *ac,
++					   struct sp_map_target *targets, int cnt)
+ {
+ 	int ret = 0;
+ 	int mmap_ret = 0;
+-	struct mm_struct *mm;
+-	bool reach_current = false;
++	int i, fail_idx = -1;
++	unsigned long current_prot = PROT_READ | PROT_WRITE;
++	bool mapped_current = false;
+ 
+-	mmap_ret = sp_map_spa_to_mm(current->mm, spa, spg_node->prot, ac, "sp_alloc");
++	/* 
++	 * Map for current process first. 
++	 * This handles physical page population and rapid ENOMEM fallback.
++	 */
++	for (i = 0; i < cnt; i++) {
++		if (targets[i].mm == current->mm) {
++			current_prot = targets[i].prot;
++			break;
++		}
++	}
++
++	mmap_ret = sp_map_spa_to_mm(current->mm, spa, current_prot, ac, "sp_alloc");
+ 	if (mmap_ret) {
+ 		/* Don't skip error for current process */
+ 		mmap_ret = (mmap_ret == SP_SKIP_ERR) ? -EINVAL : mmap_ret;
+ 		goto fallocate;
+ 	}
++	mapped_current = true;
+ 
+-	/* create mapping for each process in the group */
+-	list_for_each_entry(spg_node, &spa->spg->proc_head, proc_node) {
+-		mm = spg_node->master->mm;
+-		if (mm == current->mm) {
+-			reach_current = true;
++	/* Map for the rest of the processes in the group */
++	for (i = 0; i < cnt; i++) {
++		if (targets[i].mm == current->mm)
+ 			continue;
+-		}
+-		mmap_ret = sp_map_spa_to_mm(mm, spa, spg_node->prot, ac, "sp_alloc");
++
++		mmap_ret = sp_map_spa_to_mm(targets[i].mm, spa, targets[i].prot, ac, "sp_alloc");
+ 		if (mmap_ret) {
+-			/*
+-			 * Goto fallback procedure upon ERR_VALUE,
+-			 * but skip the coredump situation,
+-			 * because we don't want one misbehaving process to affect others.
+-			 */
+-			if (mmap_ret != SP_SKIP_ERR)
+-				goto unmap;
+-
+-			continue;
+-		}
+-		ret = mmap_ret;
+-	}
+-
+-	return ret;
+-
+-unmap:
+-	__sp_free(spa, mm);
+-	if (!reach_current)
+-		sp_munmap(current->mm, spa->va_start, spa_size(spa));
+-fallocate:
+-	/*
+-	 * Sometimes do_mm_populate() allocates some memory and then failed to
+-	 * allocate more. (e.g. memory use reaches cgroup limit.)
+-	 * In this case, it will return enomem, but will not free the
+-	 * memory which has already been allocated.
+-	 *
+-	 * So if sp_map_spa_to_mm fails, always call sp_fallocate()
+-	 * to make sure backup physical memory of the shared file is freed.
+-	 */
+-	sp_fallocate(spa);
+-
+-	return mmap_ret;
+-}
+-
+-static void *__mg_sp_alloc_nodemask(unsigned long size, unsigned long sp_flags, int spg_id,
+-			     nodemask_t *nodemask)
+-{
+-	int ret = 0;
+-	struct sp_area *spa;
+-	struct sp_group *spg;
+-	nodemask_t __nodemask;
+-	struct sp_alloc_context ac;
+-	struct sp_group_node *spg_node;
+-
+-	ret = sp_alloc_prepare(size, sp_flags, spg_id, &ac);
+-	if (ret)
+-		return ERR_PTR(ret);
+-
+-	if (!nodemask) { /* mg_sp_alloc */
+-		nodes_clear(__nodemask);
+-		node_set(ac.preferred_node_id, __nodemask);
+-		ac.nodemask = &__nodemask;
+-	} else /* mg_sp_alloc_nodemask */
+-		ac.nodemask = nodemask;
+-
+-	spg = sp_group_get_from_mm(current->mm, spg_id, &spg_node);
+-	if (!spg) {
+-		pr_err("allocation failed, can't find group(%d)\n", spg_id);
+-		return ERR_PTR(-ENODEV);
+-	}
+-
+-	down_write(&spg->rw_lock);
+-try_again:
+-	spa = sp_area_alloc(ac.size_aligned, ac.sp_flags, spg,
+-			    ac.type, current->tgid, ac.preferred_node_id);
+-	if (IS_ERR(spa)) {
+-		up_write(&spg->rw_lock);
+-		pr_err("alloc spa failed in allocation(potential no enough virtual memory when -75): %ld\n",
+-			PTR_ERR(spa));
+-		ret = PTR_ERR(spa);
+-		goto out;
+-	}
+-
+-	ret = sp_alloc_mmap_populate(spa, &ac, spg_node);
+-	if (ret == -ENOMEM && sp_alloc_fallback(spa, &ac))
+-		goto try_again;
+-
+-	if (!ret)
+-		update_mem_usage(spa_size(spa), true, spa->is_hugepage, spg_node, spa->type);
+-
+-	sp_area_put_locked(spa);
+-	up_write(&spg->rw_lock);
+-
+-out:
+-	sp_group_put(spg);
+-	if (ret)
+-		return ERR_PTR(ret);
+-	else
+-		return (void *)(spa->va_start);
++			if (mmap_ret != SP_SKIP_ERR) {
++				ret = mmap_ret;
++				fail_idx = i;
++				break;
++			}
++		}
++	}
++
++	if (ret) {
++		/* Rollback cleanly upon failure */
++		for (i = 0; i < fail_idx; i++) {
++			if (targets[i].mm == current->mm)
++				continue;
++			sp_munmap(targets[i].mm, spa->va_start, spa_size(spa));
++		}
++		if (mapped_current)
++			sp_munmap(current->mm, spa->va_start, spa_size(spa));
++
++fallocate:
++		sp_fallocate(spa);
++	}
++
++	return ret;
++}
++
++static void *__mg_sp_alloc_nodemask(unsigned long size, unsigned long sp_flags, int spg_id,
++			     nodemask_t *nodemask)
++{
++	int ret = 0;
++	struct sp_area *spa;
++	struct sp_group *spg;
++	nodemask_t __nodemask;
++	struct sp_alloc_context ac;
++	struct sp_group_node *spg_node;
++	struct sp_map_target *targets = NULL;
++	int mm_cnt = 0, i;
++	struct sp_group_node *curr_spg_node = NULL;
++
++	ret = sp_alloc_prepare(size, sp_flags, spg_id, &ac);
++	if (ret)
++		return ERR_PTR(ret);
++
++	if (!nodemask) {
++		nodes_clear(__nodemask);
++		node_set(ac.preferred_node_id, __nodemask);
++		ac.nodemask = &__nodemask;
++	} else {
++		ac.nodemask = nodemask;
++	}
++
++	spg = sp_group_get_from_mm(current->mm, spg_id, &spg_node);
++	if (!spg) {
++		pr_err("allocation failed, can't find group(%d)\n", spg_id);
++		return ERR_PTR(-ENODEV);
++	}
++
++try_again:
++	down_write(&spg->rw_lock);
++	spa = sp_area_alloc(ac.size_aligned, ac.sp_flags, spg,
++			    ac.type, current->tgid, ac.preferred_node_id);
++	if (IS_ERR(spa)) {
++		up_write(&spg->rw_lock);
++		pr_err("alloc spa failed in allocation: %ld\n", PTR_ERR(spa));
++		ret = PTR_ERR(spa);
++		goto out;
++	}
++
++	/* Snapshot Phase: Capture valid mm_structs under lock */
++	targets = kvmalloc_array(spg->proc_num, sizeof(struct sp_map_target), GFP_KERNEL);
++	if (!targets) {
++		sp_area_put_locked(spa);
++		up_write(&spg->rw_lock);
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	mm_cnt = 0;
++	curr_spg_node = NULL;
++	list_for_each_entry(spg_node, &spg->proc_head, proc_node) {
++		if (spg_node->master->mm == current->mm)
++			curr_spg_node = spg_node;
++
++		if (mmget_not_zero(spg_node->master->mm)) {
++			targets[mm_cnt].mm = spg_node->master->mm;
++			targets[mm_cnt].prot = spg_node->prot;
++			mm_cnt++;
++		}
++	}
++
++	/* 
++	 * CRITICAL: Drop the global group lock before heavy mapping operations.
++	 * spa->use_count is naturally guaranteed to be at least 1 by sp_area_alloc.
++	 */
++	up_write(&spg->rw_lock);
++
++	/* Data Plane Phase: Map memory to all snapshots locklessly */
++	ret = sp_alloc_mmap_populate_lockless(spa, &ac, targets, mm_cnt);
++
++	/* Finalization Phase: Re-acquire lock to update stats or rollback */
++	down_write(&spg->rw_lock);
++
++	if (ret == -ENOMEM && sp_alloc_fallback(spa, &ac)) {
++		for (i = 0; i < mm_cnt; i++)
++			mmput(targets[i].mm);
++		kvfree(targets);
++		targets = NULL;
++		up_write(&spg->rw_lock);
++		goto try_again;
++	}
++
++	if (!ret && curr_spg_node)
++		update_mem_usage(spa_size(spa), true, spa->is_hugepage, curr_spg_node, spa->type);
++
++	/* Drop the initial reference assigned during sp_area_alloc */
++	sp_area_put_locked(spa);
++	up_write(&spg->rw_lock);
++
++	for (i = 0; i < mm_cnt; i++)
++		mmput(targets[i].mm);
++	kvfree(targets);
++
++out:
++	sp_group_put(spg);
++	if (ret)
++		return ERR_PTR(ret);
++	else
++		return (void *)(spa->va_start);
+ }
+-- 
+2.43.0
