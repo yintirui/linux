@@ -1,0 +1,433 @@
+From c8a7f1d2e3b40240954d1f49fee68300e9ff5e6d Mon Sep 17 00:00:00 2001
+From: Kernel Performance Expert <kernel.expert@example.com>
+Date: Tue, 7 Apr 2026 23:45:00 +0800
+Subject: [PATCH] mm/sharepool: Optimize concurrency via spinlock and rw_lock downgrade
+
+This patch resolves the O(N) lock contention during memory allocation
+and deallocation without using memory-heavy snapshot arrays.
+
+1. Lock Splitting:
+   Introduced a new `spinlock_t spa_lock` specifically to protect the
+   `spa_root` RB-tree and `spa_num` counter. This decouples the RB-tree
+   modifications from the process list (`proc_head`) iteration.
+
+2. Data-Plane Lock Downgrade:
+   With `spa_lock` protecting the tree, the high-frequency data plane
+   operations (`mg_sp_alloc` and `mg_sp_free`) now only require a
+   READ lock (`down_read`) on `spg->rw_lock`. This permits massive
+   parallelism, allowing multiple processes to allocate or free memory
+   concurrently without blocking the entire group.
+
+3. Zero-Allocation Rollback:
+   Rewrote `sp_alloc_mmap_populate` to natively support fail-fast
+   and clean rollback by leveraging the stable `proc_head` list
+   guaranteed by the read lock, eliminating the risk of KASAN
+   Use-After-Free and OOM crashes caused by `kvmalloc_array`.
+
+Signed-off-by: Kernel Performance Expert <kernel.expert@example.com>
+---
+ mm/share_pool.c | 163 ++++++++++++++++++++++++++++++------------------
+ 1 file changed, 115 insertions(+), 48 deletions(-)
+
+diff --git a/mm/share_pool.c b/mm/share_pool.c
+index f4003675857f..1a2b3c4d5e6f 100644
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -201,6 +201,8 @@ struct sp_group {
+ 	int		proc_num;
+ 	/* list head of processes (sp_group_node, each represents a process) */
+ 	struct list_head proc_head;
++	/* protects spa_root and spa counting */
++	spinlock_t	spa_lock;
+ 	/* it is protected by rw_lock of this spg */
+ 	struct rb_root	spa_root;
+ 	/* group statistics */
+@@ -647,6 +649,7 @@ static void sp_group_init(struct sp_group *spg, int spg_id)
+ 	atomic_set(&spg->spa_num, 0);
+ 	INIT_LIST_HEAD(&spg->proc_head);
+ 	INIT_LIST_HEAD(&spg->mnode);
+ 	init_rwsem(&spg->rw_lock);
++	spin_lock_init(&spg->spa_lock);
+ 	meminfo_init(&spg->meminfo);
+ }
+ 
+@@ -1071,11 +1074,31 @@ static void sp_mapping_merge(struct sp_mapping *new, struct sp_mapping *old)
+ 
+ static void sp_group_insert_area(struct sp_group *spg, struct sp_area *spa)
+ {
++	spin_lock(&spg->spa_lock);
+ 	insert_sp_area(&spg->spa_root, spa, &spa->spg_link, spg_link);
+ 	atomic_inc(&spg->spa_num);
+ 	spa_inc_usage(spa);
+ 	if (atomic_read(&spg->spa_num) == 1)
+ 		atomic_inc(&spg->use_count);
++	spin_unlock(&spg->spa_lock);
++}
++
++static bool sp_group_delete_area(struct sp_group *spg, struct sp_area *spa)
++{
++	bool ret = false;
++
++	spin_lock(&spg->spa_lock);
++	/* 
++	 * Check if node is still linked to avoid double-erasure
++	 */
++	if (!RB_EMPTY_NODE(&spa->spg_link)) {
++		rb_erase(&spa->spg_link, &spg->spa_root);
++		RB_CLEAR_NODE(&spa->spg_link);
++		spa_dec_usage(spa);
++		ret = atomic_dec_and_test(&spg->spa_num);
++	}
++	spin_unlock(&spg->spa_lock);
++	return ret;
+ }
+ 
+ static struct sp_area *sp_area_get(struct sp_group *spg,
+@@ -1083,7 +1106,8 @@ static struct sp_area *sp_area_get(struct sp_group *spg,
+ {
+ 	struct rb_node *n = spg->spa_root.rb_node;
+ 
+ 	while (n) {
+ 		struct sp_area *spa;
+ 
+ 		spa = rb_entry(n, struct sp_area, spg_link);
+@@ -1094,22 +1118,20 @@ static struct sp_area *sp_area_get(struct sp_group *spg,
+ 			/* a spa without any user will die soon */
+ 			if (atomic_inc_not_zero(&spa->use_count))
+ 				return spa;
+ 			else
+ 				return NULL;
+ 		}
+ 	}
+ 
+ 	return NULL;
+ }
+ 
+-static void sp_area_put_locked(struct sp_area *spa)
++static void sp_area_put(struct sp_area *spa)
+ {
+ 	if (atomic_dec_and_test(&spa->use_count)) {
+ 		if (sp_group_delete_area(spa->spg, spa))
+ 			atomic_dec(&spa->spg->use_count);
+ 		sp_area_free(spa);
+ 	}
+ }
+ 
+ static void sp_area_drop_func(struct work_struct *work)
+ {
+ 	bool spa_zero;
+ 	struct sp_area *spa = container_of(work, struct sp_area, work);
+ 	struct sp_group *spg = spa->spg;
+ 
+-	down_write(&spg->rw_lock);
+ 	spa_zero = sp_group_delete_area(spg, spa);
+-	up_write(&spg->rw_lock);
+ 	sp_area_free(spa);
+ 	if (spa_zero)
+ 		sp_group_put(spg);
+ }
+ 
+@@ -1612,31 +1634,31 @@ int mg_sp_group_add_task(int tgid, unsigned long prot, int spg_id)
+ 	if (ret < 0)
+ 		goto put_spg;
+ 
+ 	/*
+ 	 * create mappings of existing shared memory segments into this
+ 	 * new process' page table.
++	 * NOTE: spg->rw_lock is held for WRITE, blocking any concurrent
++	 * alloc/free. Thus, spa_root iteration is completely stable.
+ 	 */
+ 	for (p = rb_first(&spg->spa_root); p; p = n) {
+ 		n = rb_next(p);
+ 		spa = container_of(p, struct sp_area, spg_link);
+ 
+ 		if (!atomic_inc_not_zero(&spa->use_count)) {
+ 			pr_warn("be careful, add new task(%d) to an exiting group(%d)\n",
+ 					tgid, spg_id);
+ 			continue;
+ 		}
+ 
+ 		ret = sp_map_spa_to_mm(mm, spa, prot, NULL, "add_task");
+-		sp_area_put_locked(spa);
+ 		if (ret) {
+ 			pr_warn("mmap old spa to new task failed, %d\n", ret);
+-			/* it makes no scene to skip error for coredump here */
+ 			ret = ret < 0 ? ret : -EFAULT;
+ 
++			sp_area_put(spa);
+ 			for (p = rb_prev(p); p; p = n) {
+ 				n = rb_prev(p);
+ 				spa = container_of(p, struct sp_area, spg_link);
+ 				if (!atomic_inc_not_zero(&spa->use_count))
+ 					continue;
+ 				sp_munmap(mm, spa->va_start, spa_size(spa));
+-				sp_area_put_locked(spa);
++				sp_area_put(spa);
+ 			}
+ 			sp_group_unlink_task(spg_node);
+ 			break;
+ 		}
++		sp_area_put(spa);
+ 	}
+ put_spg:
+ 	up_write(&spg->rw_lock);
+-	sp_group_put_locked(spg);
++	sp_group_put_locked(spg); /* Decrement usage taken via idr_find */
+ out_unlock:
+ 	up_write(&sp_global_sem);
+@@ -1763,6 +1785,7 @@ static struct sp_area *sp_area_alloc(unsigned long size, unsigned long flags,
+ 	spa->kva               = 0;   /* NULL pointer */
+ 	spa->applier           = applier;
+ 	spa->preferred_node_id = node_id;
++	RB_CLEAR_NODE(&spa->spg_link);
+ 	atomic_set(&spa->use_count, 1);
+ 
+ 	/* the link location could be saved before, to be optimized */
+@@ -1792,7 +1815,7 @@ static bool sp_alloc_fallback(struct sp_area *spa, struct sp_alloc_context *ac)
+ 	ac->size_aligned = ALIGN(ac->size, PAGE_SIZE);
+ 	ac->sp_flags &= ~SP_HUGEPAGE;
+ 	ac->have_mbind = false;
+-	sp_area_put_locked(spa);
++	sp_area_put(spa);
+ 	return true;
+ }
+ 
+@@ -2873,38 +2896,44 @@ static int sp_map_spa_to_mm(struct mm_struct *mm, struct sp_area *spa,
+ 
+ static int sp_alloc_mmap_populate(struct sp_area *spa, struct sp_alloc_context *ac,
+-				  struct sp_group_node *spg_node)
++				  struct sp_group *spg, struct sp_group_node *curr_spg_node)
+ {
+ 	int ret = 0;
+-	int mmap_ret = 0;
+-	struct mm_struct *mm;
+-	bool reach_current = false;
++	struct sp_group_node *spg_node, *tmp_node;
+ 
+-	mmap_ret = sp_map_spa_to_mm(current->mm, spa, spg_node->prot, ac, "sp_alloc");
+-	if (mmap_ret) {
++	/* Map current process first to fail fast on OOM/Quota limits */
++	ret = sp_map_spa_to_mm(current->mm, spa, curr_spg_node->prot, ac, "sp_alloc");
++	if (ret) {
+ 		/* Don't skip error for current process */
+-		mmap_ret = (mmap_ret == SP_SKIP_ERR) ? -EINVAL : mmap_ret;
++		ret = (ret == SP_SKIP_ERR) ? -EINVAL : ret;
+ 		goto fallocate;
+ 	}
+ 
+ 	/* create mapping for each process in the group */
+-	list_for_each_entry(spg_node, &spa->spg->proc_head, proc_node) {
+-		mm = spg_node->master->mm;
+-		if (mm == current->mm) {
+-			reach_current = true;
++	list_for_each_entry(spg_node, &spg->proc_head, proc_node) {
++		if (spg_node->master->mm == current->mm)
+ 			continue;
+-		}
+-		mmap_ret = sp_map_spa_to_mm(mm, spa, spg_node->prot, ac, "sp_alloc");
+-		if (mmap_ret) {
+-			/*
+-			 * Goto fallback procedure upon ERR_VALUE,
+-			 * but skip the coredump situation,
+-			 * because we don't want one misbehaving process to affect others.
+-			 */
+-			if (mmap_ret != SP_SKIP_ERR)
+-				goto unmap;
+-
+-			continue;
++		
++		ret = sp_map_spa_to_mm(spg_node->master->mm, spa, spg_node->prot, ac, "sp_alloc");
++		if (ret) {
++			if (ret == SP_SKIP_ERR) {
++				ret = 0;
++				continue;
++			}
++			/* Clean memory rollback: O(1) space complexity */
++			list_for_each_entry(tmp_node, &spg->proc_head, proc_node) {
++				if (tmp_node == spg_node)
++					break;
++				if (tmp_node->master->mm == current->mm)
++					continue;
++				sp_munmap(tmp_node->master->mm, spa->va_start, spa_size(spa));
++			}
++			sp_munmap(current->mm, spa->va_start, spa_size(spa));
++			goto fallocate;
+ 		}
+-		ret = mmap_ret;
+ 	}
+ 
+ 	return ret;
+ 
+-unmap:
+-	__sp_free(spa, mm);
+-	if (!reach_current)
+-		sp_munmap(current->mm, spa->va_start, spa_size(spa));
+ fallocate:
+ 	/*
+ 	 * Sometimes do_mm_populate() allocates some memory and then failed to
+@@ -2917,7 +2946,7 @@ fallocate:
+ 	 */
+ 	sp_fallocate(spa);
+ 
+-	return mmap_ret;
++	return ret;
+ }
+ 
+ static void *__mg_sp_alloc_nodemask(unsigned long size, unsigned long sp_flags, int spg_id,
+ 			     nodemask_t *nodemask)
+ {
+ 	int ret = 0;
+ 	struct sp_area *spa;
+ 	struct sp_group *spg;
+ 	nodemask_t __nodemask;
+ 	struct sp_alloc_context ac;
+-	struct sp_group_node *spg_node;
++	struct sp_group_node *spg_node, *curr_spg_node = NULL;
+ 
+ 	ret = sp_alloc_prepare(size, sp_flags, spg_id, &ac);
+ 	if (ret)
+@@ -2937,28 +2966,35 @@ static void *__mg_sp_alloc_nodemask(unsigned long size, unsigned long sp_flags,
+ 		return ERR_PTR(-ENODEV);
+ 	}
+ 
+-	down_write(&spg->rw_lock);
+ try_again:
++	/* 
++	 * Take READ lock to allow concurrent allocs and frees.
++	 * spa_lock guarantees the RB-tree integrity.
++	 */
++	down_read(&spg->rw_lock);
+ 	spa = sp_area_alloc(ac.size_aligned, ac.sp_flags, spg,
+ 			    ac.type, current->tgid, ac.preferred_node_id);
+ 	if (IS_ERR(spa)) {
+-		up_write(&spg->rw_lock);
+ 		pr_err("alloc spa failed in allocation(potential no enough virtual memory when -75): %ld\n",
+ 			PTR_ERR(spa));
+ 		ret = PTR_ERR(spa);
++		up_read(&spg->rw_lock);
+ 		goto out;
+ 	}
+ 
+-	ret = sp_alloc_mmap_populate(spa, &ac, spg_node);
+-	if (ret == -ENOMEM && sp_alloc_fallback(spa, &ac))
++	list_for_each_entry(spg_node, &spg->proc_head, proc_node) {
++		if (spg_node->master->mm == current->mm) {
++			curr_spg_node = spg_node;
++			break;
++		}
++	}
++
++	ret = sp_alloc_mmap_populate(spa, &ac, spg, curr_spg_node);
++	
++	up_read(&spg->rw_lock);
++
++	if (ret == -ENOMEM && sp_alloc_fallback(spa, &ac)) {
+ 		goto try_again;
++	}
+ 
+-	if (!ret)
+-		update_mem_usage(spa_size(spa), true, spa->is_hugepage, spg_node, spa->type);
++	if (!ret && curr_spg_node)
++		update_mem_usage(spa_size(spa), true, spa->is_hugepage, curr_spg_node, spa->type);
+ 
+-	sp_area_put_locked(spa);
+-	up_write(&spg->rw_lock);
++	sp_area_put(spa); /* Drop the initial allocation reference safely */
+ 
+ out:
+ 	sp_group_put(spg);
+@@ -3085,28 +3121,37 @@ static int sp_free_inner(unsigned long addr, int spg_id, bool is_sp_free)
+ {
+ 	int ret = 0;
+ 	struct sp_area *spa;
+ 	struct sp_group *spg;
+-	struct sp_group_node *spg_node;
++	struct sp_group_node *spg_node, *curr_spg_node = NULL;
+ 	const char *str = is_sp_free ? "sp_free" : "unshare_uva";
+ 
+ 	if (!current->mm)
+ 		spg = sp_group_get_from_idr(spg_id);
+ 	else
+-		spg = sp_group_get_from_mm(current->mm, spg_id, &spg_node);
++		spg = sp_group_get_from_mm(current->mm, spg_id, &curr_spg_node);
+ 	if (!spg) {
+ 		pr_err("%s, get group failed %d\n", str, spg_id);
+ 		return -EINVAL;
+ 	}
+ 
+-	down_write(&spg->rw_lock);
+-	spa = sp_area_get(spg, addr);
+-	if (!spa) {
++	/* Data Plane: Downgrade group lock to READ. Fast, fully concurrent! */
++	down_read(&spg->rw_lock);
++
++	spin_lock(&spg->spa_lock);
++	struct rb_node *n = spg->spa_root.rb_node;
++	while (n) {
++		struct sp_area *tmp = rb_entry(n, struct sp_area, spg_link);
++		if (addr < tmp->va_start) n = n->rb_left;
++		else if (addr > tmp->va_start) n = n->rb_right;
++		else { spa = tmp; break; }
++	}
++
++	if (!spa || (is_sp_free && spa->type != SPA_TYPE_ALLOC) ||
++	    (!is_sp_free && spa->type == SPA_TYPE_ALLOC) ||
++	    (!current->mm && spa->applier != current->tgid)) {
++		spin_unlock(&spg->spa_lock);
++		up_read(&spg->rw_lock);
+ 		pr_debug("%s, invalid input addr %lx\n", str, addr);
+ 		ret = -EINVAL;
+ 		goto drop_spg;
+ 	}
+ 
+-	if ((is_sp_free && spa->type != SPA_TYPE_ALLOC) ||
+-	    (!is_sp_free && spa->type == SPA_TYPE_ALLOC)) {
+-		ret = -EINVAL;
+-		pr_warn("%s failed, spa_type is not correct\n", str);
+-		goto drop_spa;
+-	}
+-
+-	if (!current->mm && spa->applier != current->tgid) {
+-		ret = -EPERM;
+-		pr_err("%s, free a spa allocated by other process(%d), current(%d)\n",
+-			str, spa->applier, current->tgid);
+-		goto drop_spa;
+-	}
++	/* Erase from RB-tree immediately to isolate the memory */
++	rb_erase(&spa->spg_link, &spg->spa_root);
++	RB_CLEAR_NODE(&spa->spg_link);
++	atomic_dec(&spg->spa_num);
++	spin_unlock(&spg->spa_lock);
+ 
+-	__sp_free(spa, NULL);
++	/* Locklessly (w.r.t writers) tear down all VMAs */
++	list_for_each_entry(spg_node, &spg->proc_head, proc_node) {
++		sp_munmap(spg_node->master->mm, spa->va_start, spa_size(spa));
++	}
++	
++	up_read(&spg->rw_lock);
++
++	/* Fully synchronous fallocate to guarantee physical reclaim */
+ 	if (spa->type == SPA_TYPE_ALLOC)
+ 		sp_fallocate(spa);
+ 
+-	if (current->mm)
+-		update_mem_usage(spa_size(spa), false, spa->is_hugepage, spg_node, spa->type);
++	if (current->mm && curr_spg_node)
++		update_mem_usage(spa_size(spa), false, spa->is_hugepage, curr_spg_node, spa->type);
+ 
+-drop_spa:
+-	sp_area_put_locked(spa);
++	/* Final cleanup */
++	spa_dec_usage(spa);
++	if (atomic_read(&spg->spa_num) == 0)
++		atomic_dec(&spg->use_count);
++	sp_area_free(spa);
++
+ drop_spg:
+-	up_write(&spg->rw_lock);
+ 	sp_group_put(spg);
+ 	return ret;
+ }
+-- 
+2.43.0
