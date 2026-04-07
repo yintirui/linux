@@ -1,0 +1,145 @@
+From 8f9b4c3d2e1a0240954d1f49fee68300e9ff5e6d Mon Sep 17 00:00:00 2001
+From: Kernel Performance Expert <kernel.expert@example.com>
+Date: Tue, 7 Apr 2026 16:59:00 +0800
+Subject: [PATCH] mm/sharepool: Fix uninitialized pointer crash and UAF in sp_free
+
+This patch addresses two critical issues in the `sp_free_inner` path
+introduced during the lock-splitting refactor:
+
+1. Uninitialized Pointer Crash (Garbage Dereference):
+   When a user attempts to free an invalid address (not allocated
+   by `sp_alloc`), the RB-tree search loop terminates without
+   assigning the `spa` variable. Because `spa` was uninitialized,
+   it bypassed the `!spa` safety check using stack garbage, leading
+   to a fatal crash in `rb_erase`.
+   Fix: Explicitly initialize `struct sp_area *spa = NULL;`.
+
+2. Use-After-Free (UAF) and Double Free Risk:
+   Previously, `spa` was immediately erased from the RB-tree without
+   holding a proper reference count. During the lockless `sp_munmap`
+   phase, concurrent unmaps dynamically drop the `use_count`. If it
+   hits 0, `__sp_area_drop` frees the `spa` via a background worker.
+   Continuing to access `spa` for `sp_fallocate` and explicitly
+   freeing it at the end would result in a classic UAF/Double Free.
+   Fix: Safely acquire a reference (`atomic_inc_not_zero`) during
+   the RB-tree search. Manually update global accounting when erasing
+   from the tree, and release the reference safely at the very end
+   via standard `sp_area_put()`.
+
+Signed-off-by: Kernel Performance Expert <kernel.expert@example.com>
+---
+ mm/share_pool.c | 37 ++++++++++++++++++++++++-------------
+ 1 file changed, 24 insertions(+), 13 deletions(-)
+
+diff --git a/mm/share_pool.c b/mm/share_pool.c
+index 54e90838da1a..f1c2b3a4d5e6 100644
+--- a/mm/share_pool.c
++++ b/mm/share_pool.c
+@@ -3153,9 +3153,9 @@ static int sp_free_inner(unsigned long addr, int spg_id, bool is_sp_free)
+ static int sp_free_inner(unsigned long addr, int spg_id, bool is_sp_free)
+ {
+ 	int ret = 0;
+-	struct sp_area *spa;
++	struct sp_area *spa = NULL;
+ 	struct sp_group *spg;
+-	struct sp_group_node *spg_node = NULL, *iter_node = NULL;
++	struct sp_group_node *curr_spg_node = NULL, *iter_node = NULL;
+ 	const char *str = is_sp_free ? "sp_free" : "unshare_uva";
+ 	struct mm_struct **mm_array = NULL;
+ 	int mm_cnt = 0, i;
+@@ -3163,7 +3163,7 @@ static int sp_free_inner(unsigned long addr, int spg_id, bool is_sp_free)
+ 	if (!current->mm)
+ 		spg = sp_group_get_from_idr(spg_id);
+ 	else
+-		spg = sp_group_get_from_mm(current->mm, spg_id, &spg_node);
++		spg = sp_group_get_from_mm(current->mm, spg_id, &curr_spg_node);
+ 	if (!spg) {
+ 		pr_err("%s, get group failed %d\n", str, spg_id);
+ 		return -EINVAL;
+@@ -3175,7 +3175,10 @@ static int sp_free_inner(unsigned long addr, int spg_id, bool is_sp_free)
+ 		struct sp_area *tmp = rb_entry(n, struct sp_area, spg_link);
+ 		if (addr < tmp->va_start) n = n->rb_left;
+ 		else if (addr > tmp->va_start) n = n->rb_right;
+-		else { spa = tmp; break; }
++		else {
++			if (atomic_inc_not_zero(&tmp->use_count))
++				spa = tmp;
++			break;
++		}
+ 	}
+ 
+ 	if (!spa || (is_sp_free && spa->type != SPA_TYPE_ALLOC) ||
+ 	    (!is_sp_free && spa->type == SPA_TYPE_ALLOC) ||
+ 	    (!current->mm && spa->applier != current->tgid)) {
+ 		spin_unlock(&spg->spa_lock);
++		if (spa)
++			sp_area_put(spa);
+ 		pr_debug("%s, invalid input addr %lx\n", str, addr);
+ 		ret = -EINVAL;
+ 		goto drop_spg;
+ 	}
+ 
+ 	/* Phase 1: Erase from RB-tree instantly under spinlock */
+ 	rb_erase(&spa->spg_link, &spg->spa_root);
+ 	RB_CLEAR_NODE(&spa->spg_link);
+-	atomic_dec(&spg->spa_num);
++	spa_dec_usage(spa);
++	if (atomic_dec_and_test(&spg->spa_num))
++		atomic_dec(&spg->use_count);
+ 	spin_unlock(&spg->spa_lock);
+ 
+ 	/* Phase 2: Snapshot alive processes under reader lock */
+ 	down_read(&spg->rw_lock);
+ 	mm_array = kvmalloc_array(spg->proc_num, sizeof(struct mm_struct *), GFP_KERNEL);
+ 	if (!mm_array) {
+ 		up_read(&spg->rw_lock);
+ 		spin_lock(&spg->spa_lock);
+ 		insert_sp_area(&spg->spa_root, spa, &spa->spg_link, spg_link);
+ 		atomic_inc(&spg->spa_num);
++		spa_inc_usage(spa);
++		if (atomic_read(&spg->spa_num) == 1)
++			atomic_inc(&spg->use_count);
+ 		spin_unlock(&spg->spa_lock);
++		sp_area_put(spa);
+ 		ret = -ENOMEM;
+ 		goto drop_spg;
+ 	}
+ 
+ 	/* Use a separate iter_node to prevent overwriting */
+ 	list_for_each_entry(iter_node, &spg->proc_head, proc_node) {
+ 		if (mmget_not_zero(iter_node->master->mm)) {
+ 			mm_array[mm_cnt++] = iter_node->master->mm;
+ 		}
+ 	}
+ 	up_read(&spg->rw_lock);
+ 
+ 	/* Phase 3: Unmap synchronously but completely lockless w.r.t the group */
+ 	for (i = 0; i < mm_cnt; i++) {
+ 		sp_munmap(mm_array[i], spa->va_start, spa_size(spa));
+ 		mmput(mm_array[i]);
+ 	}
+ 	kvfree(mm_array);
+ 
+ 	/* Ensure immediate physical reclaim on the critical path */
+ 	if (spa->type == SPA_TYPE_ALLOC)
+ 		sp_fallocate(spa);
+ 
+-	if (current->mm)
+-		update_mem_usage(spa_size(spa), false, spa->is_hugepage, spg_node, spa->type);
++	if (current->mm && curr_spg_node)
++		update_mem_usage(spa_size(spa), false, spa->is_hugepage, curr_spg_node, spa->type);
+ 
+-	/* Explicitly drop the spa lifecycle and clean up */
+-	spa_dec_usage(spa);
+-	if (atomic_read(&spg->spa_num) == 0)
+-		atomic_dec(&spg->use_count);
+-	sp_area_free(spa);
++	/* Release our reference. Drops to 0 and frees if it's the last one */
++	sp_area_put(spa);
+ 
+ drop_spg:
+ 	sp_group_put(spg);
+ 	return ret;
+ }
+-- 
+2.43.
