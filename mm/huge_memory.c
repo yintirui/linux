@@ -2453,6 +2453,13 @@ static bool has_deposited_pgtable(struct vm_area_struct *vma, pmd_t pmdval,
 		return !vma_is_dax(vma);
 
 	/*
+	 * remap_pfn_range() is disallowed to create huge pfn mapping when there is
+	 * either a ->fault or ->huge_fault registered, which are deposited.
+	 */
+    if (vma_test(vma, VMA_PFNMAP_BIT))
+		return !vma->vm_ops || (!vma->vm_ops->fault && !vma->vm_ops->huge_fault);
+
+	/*
 	 * Otherwise, only anonymous folios are deposited, see
 	 * __do_huge_pmd_anonymous_page().
 	 */
@@ -3095,14 +3102,34 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 
 	if (!vma_is_anonymous(vma)) {
 		old_pmd = pmdp_huge_clear_flush(vma, haddr, pmd);
+
+		if (!vma_is_dax(vma) && vma_is_special_huge(vma)) {
+			pte_t entry;
+
+			if (!pmd_special(old_pmd)) {
+				zap_deposited_table(mm, pmd);
+				return;
+			}
+			pgtable = pgtable_trans_huge_withdraw(mm, pmd);
+			if (unlikely(!pgtable))
+				return;
+			pmd_populate(mm, &_pmd, pgtable);
+			pte = pte_offset_map(&_pmd, haddr);
+			entry = pfn_pte(pmd_pfn(old_pmd), pmd_pgprot(old_pmd));
+			set_ptes(mm, haddr, pte, entry, HPAGE_PMD_NR);
+			pte_unmap(pte);
+
+			smp_wmb(); /* make pte visible before pmd */
+			pmd_populate(mm, pmd, pgtable);
+			return;
+		}
+
 		/*
 		 * We are going to unmap this huge page. So
 		 * just go ahead and zap it
 		 */
 		if (arch_needs_pgtable_deposit())
 			zap_deposited_table(mm, pmd);
-		if (vma_is_special_huge(vma))
-			return;
 		if (unlikely(pmd_is_migration_entry(old_pmd))) {
 			const softleaf_t old_entry = softleaf_from_pmd(old_pmd);
 
