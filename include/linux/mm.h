@@ -1489,6 +1489,11 @@ static inline bool vma_is_anonymous(struct vm_area_struct *vma)
 	return !vma->vm_ops;
 }
 
+static inline bool vma_has_fault_handler(struct vm_area_struct *vma)
+{
+	return vma->vm_ops && (vma->vm_ops->fault || vma->vm_ops->huge_fault);
+}
+
 /*
  * Indicate if the VMA is a heap for the given task; for
  * /proc/PID/maps that is the heap of the main task.
