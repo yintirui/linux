@@ -1953,35 +1953,15 @@ int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 		  struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma)
 {
 	spinlock_t *dst_ptl, *src_ptl;
-	struct page *src_page;
 	struct folio *src_folio;
 	pmd_t pmd;
 	pgtable_t pgtable = NULL;
 	int ret = -ENOMEM;
 
-	pmd = pmdp_get_lockless(src_pmd);
-	if (unlikely(pmd_present(pmd) && pmd_special(pmd) &&
-		     !is_huge_zero_pmd(pmd))) {
-		dst_ptl = pmd_lock(dst_mm, dst_pmd);
-		src_ptl = pmd_lockptr(src_mm, src_pmd);
-		spin_lock_nested(src_ptl, SINGLE_DEPTH_NESTING);
-		/*
-		 * No need to recheck the pmd, it can't change with write
-		 * mmap lock held here.
-		 *
-		 * Meanwhile, making sure it's not a CoW VMA with writable
-		 * mapping, otherwise it means either the anon page wrongly
-		 * applied special bit, or we made the PRIVATE mapping be
-		 * able to wrongly write to the backend MMIO.
-		 */
-		VM_WARN_ON_ONCE(is_cow_mapping(src_vma->vm_flags) && pmd_write(pmd));
-		goto set_pmd;
-	}
-
-	/* Skip if can be re-fill on fault */
-	if (!vma_is_anonymous(dst_vma))
-		return 0;
-
+	/*
+	 * Special PMDs need a deposited page table in the child so that later
+	 * split/teardown paths can safely withdraw it.
+	 */
 	pgtable = pte_alloc_one(dst_mm);
 	if (unlikely(!pgtable))
 		goto out;
@@ -1993,48 +1973,71 @@ int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 	ret = -EAGAIN;
 	pmd = *src_pmd;
 
-	if (unlikely(thp_migration_supported() &&
-		     pmd_is_valid_softleaf(pmd))) {
+	if (likely(pmd_present(pmd))) {
+		src_folio = vm_normal_folio_pmd(src_vma, addr, pmd);
+		if (unlikely(!src_folio)) {
+			/*
+			 * When page table lock is held, the huge zero pmd should not be
+			 * under splitting since we don't split the page itself, only pmd to
+			 * a page table.
+			 */
+			if (is_huge_zero_pmd(pmd)) {
+				/*
+				 * mm_get_huge_zero_folio() will never allocate a new
+				 * folio here, since we already have a zero page to
+				 * copy. It just takes a reference.
+				 */
+				mm_get_huge_zero_folio(dst_mm);
+				goto out_zero_page;
+			}
+
+			/*
+			 * Making sure it's not a CoW VMA with writable
+			 * mapping, otherwise it means either the anon page wrongly
+			 * applied special bit, or we made the PRIVATE mapping be
+			 * able to wrongly write to the backend MMIO.
+			 */
+			VM_WARN_ON_ONCE(is_cow_mapping(src_vma->vm_flags) && pmd_write(pmd));
+			goto out_deposit;
+		}
+
+		if (!folio_test_anon(src_folio)) {
+			/* File/shmem THPs are copied lazily by refaulting. */
+			pte_free(dst_mm, pgtable);
+			ret = 0;
+			goto out_unlock;
+		}
+
+		folio_get(src_folio);
+		if (unlikely(folio_try_dup_anon_rmap_pmd(src_folio,
+							 &src_folio->page,
+							 dst_vma, src_vma))) {
+			/* Page maybe pinned: split and retry the fault on PTEs. */
+			folio_put(src_folio);
+			pte_free(dst_mm, pgtable);
+			spin_unlock(src_ptl);
+			spin_unlock(dst_ptl);
+			__split_huge_pmd(src_vma, src_pmd, addr, false);
+			return -EAGAIN;
+		}
+		add_mm_counter(dst_mm, MM_ANONPAGES, HPAGE_PMD_NR);
+
+	} else if (unlikely(thp_migration_supported() && pmd_is_valid_softleaf(pmd))) {
+		if (unlikely(!vma_is_anonymous(dst_vma))) {
+			pte_free(dst_mm, pgtable);
+			ret = 0;
+			goto out_unlock;
+		}
 		copy_huge_non_present_pmd(dst_mm, src_mm, dst_pmd, src_pmd, addr,
 					  dst_vma, src_vma, pmd, pgtable);
 		ret = 0;
 		goto out_unlock;
-	}
 
-	if (unlikely(!pmd_trans_huge(pmd))) {
+	} else {
 		pte_free(dst_mm, pgtable);
 		goto out_unlock;
 	}
-	/*
-	 * When page table lock is held, the huge zero pmd should not be
-	 * under splitting since we don't split the page itself, only pmd to
-	 * a page table.
-	 */
-	if (is_huge_zero_pmd(pmd)) {
-		/*
-		 * mm_get_huge_zero_folio() will never allocate a new
-		 * folio here, since we already have a zero page to
-		 * copy. It just takes a reference.
-		 */
-		mm_get_huge_zero_folio(dst_mm);
-		goto out_zero_page;
-	}
 
-	src_page = pmd_page(pmd);
-	VM_BUG_ON_PAGE(!PageHead(src_page), src_page);
-	src_folio = page_folio(src_page);
-
-	folio_get(src_folio);
-	if (unlikely(folio_try_dup_anon_rmap_pmd(src_folio, src_page, dst_vma, src_vma))) {
-		/* Page maybe pinned: split and retry the fault on PTEs. */
-		folio_put(src_folio);
-		pte_free(dst_mm, pgtable);
-		spin_unlock(src_ptl);
-		spin_unlock(dst_ptl);
-		__split_huge_pmd(src_vma, src_pmd, addr, false);
-		return -EAGAIN;
-	}
-	add_mm_counter(dst_mm, MM_ANONPAGES, HPAGE_PMD_NR);
 out_zero_page:
 	mm_inc_nr_ptes(dst_mm);
 	pgtable_trans_huge_deposit(dst_mm, dst_pmd, pgtable);
@@ -2042,6 +2045,10 @@ out_zero_page:
 	if (!userfaultfd_wp(dst_vma))
 		pmd = pmd_clear_uffd_wp(pmd);
 	pmd = pmd_wrprotect(pmd);
+	goto set_pmd;
+out_deposit:
+	mm_inc_nr_ptes(dst_mm);
+	pgtable_trans_huge_deposit(dst_mm, dst_pmd, pgtable);
 set_pmd:
 	pmd = pmd_mkold(pmd);
 	set_pmd_at(dst_mm, addr, dst_pmd, pmd);
