@@ -33,6 +33,50 @@
 
 #define pmd_folio(pmd) page_folio(pmd_page(pmd))
 
+#ifdef __HAVE_ARCH_PMD_SPECIAL
+static inline bool pgtable_has_pmd_special(void)
+{
+	return true;
+}
+#else
+static inline bool pgtable_has_pmd_special(void)
+{
+	return false;
+}
+
+static inline bool pmd_special(pmd_t pmd)
+{
+	return false;
+}
+
+static inline pmd_t pmd_mkspecial(pmd_t pmd)
+{
+	return pmd;
+}
+#endif	/* __HAVE_ARCH_PMD_SPECIAL */
+
+#ifdef __HAVE_ARCH_PUD_SPECIAL
+static inline bool pgtable_has_pud_special(void)
+{
+	return true;
+}
+#else
+static inline bool pgtable_has_pud_special(void)
+{
+	return false;
+}
+
+static inline bool pud_special(pud_t pud)
+{
+	return false;
+}
+
+static inline pud_t pud_mkspecial(pud_t pud)
+{
+	return pud;
+}
+#endif	/* __HAVE_ARCH_PUD_SPECIAL */
+
 /*
  * A page table page can be thought of an array like this: pXd_t[PTRS_PER_PxD]
  *

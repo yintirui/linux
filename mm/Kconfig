@@ -983,18 +983,6 @@ config ASYNC_KERNEL_PGTABLE_FREE
 	def_bool n
 
 # TODO: Allow to be enabled without THP
-config ARCH_SUPPORTS_HUGE_PFNMAP
-	def_bool n
-	depends on TRANSPARENT_HUGEPAGE
-
-config ARCH_SUPPORTS_PMD_PFNMAP
-	def_bool y
-	depends on ARCH_SUPPORTS_HUGE_PFNMAP && HAVE_ARCH_TRANSPARENT_HUGEPAGE
-
-config ARCH_SUPPORTS_PUD_PFNMAP
-	def_bool y
-	depends on ARCH_SUPPORTS_HUGE_PFNMAP && HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD
-
 #
 # Architectures that always use weak definitions for percpu
 # variables in modules should set this.

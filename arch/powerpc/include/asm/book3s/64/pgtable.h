@@ -1289,7 +1289,7 @@ static inline pud_t pud_mkhuge(pud_t pud)
 	return pud;
 }
 
-#ifdef CONFIG_ARCH_SUPPORTS_PMD_PFNMAP
+#define __HAVE_ARCH_PMD_SPECIAL
 static inline bool pmd_special(pmd_t pmd)
 {
 	return pte_special(pmd_pte(pmd));
@@ -1299,9 +1299,8 @@ static inline pmd_t pmd_mkspecial(pmd_t pmd)
 {
 	return pte_pmd(pte_mkspecial(pmd_pte(pmd)));
 }
-#endif
 
-#ifdef CONFIG_ARCH_SUPPORTS_PUD_PFNMAP
+#define __HAVE_ARCH_PUD_SPECIAL
 static inline bool pud_special(pud_t pud)
 {
 	return pte_special(pud_pte(pud));
@@ -1311,7 +1310,6 @@ static inline pud_t pud_mkspecial(pud_t pud)
 {
 	return pte_pud(pte_mkspecial(pud_pte(pud)));
 }
-#endif
 
 #define __HAVE_ARCH_PMDP_SET_ACCESS_FLAGS
 extern int pmdp_set_access_flags(struct vm_area_struct *vma,

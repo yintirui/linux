@@ -607,13 +607,12 @@ static inline pmd_t pmd_mkhuge(pmd_t pmd)
 	return __pmd((pmd_val(pmd) & ~mask) | val);
 }
 
-#ifdef CONFIG_ARCH_SUPPORTS_PMD_PFNMAP
+#define __HAVE_ARCH_PMD_SPECIAL
 #define pmd_special(pte)	(!!((pmd_val(pte) & PTE_SPECIAL)))
 static inline pmd_t pmd_mkspecial(pmd_t pmd)
 {
 	return set_pmd_bit(pmd, __pgprot(PTE_SPECIAL));
 }
-#endif
 
 #define __pmd_to_phys(pmd)	__pte_to_phys(pmd_pte(pmd))
 #define __phys_to_pmd_val(phys)	__phys_to_pte_val(phys)

@@ -864,7 +864,7 @@ static inline pmd_t pmd_mkdirty(pmd_t pmd)
 	return pte_pmd(pte_mkdirty(pmd_pte(pmd)));
 }
 
-#ifdef CONFIG_ARCH_SUPPORTS_PMD_PFNMAP
+#define __HAVE_ARCH_PMD_SPECIAL
 static inline bool pmd_special(pmd_t pmd)
 {
 	return pte_special(pmd_pte(pmd));
@@ -874,9 +874,8 @@ static inline pmd_t pmd_mkspecial(pmd_t pmd)
 {
 	return pte_pmd(pte_mkspecial(pmd_pte(pmd)));
 }
-#endif
 
-#ifdef CONFIG_ARCH_SUPPORTS_PUD_PFNMAP
+#define __HAVE_ARCH_PUD_SPECIAL
 static inline bool pud_special(pud_t pud)
 {
 	return pte_special(pud_pte(pud));
@@ -886,7 +885,6 @@ static inline pud_t pud_mkspecial(pud_t pud)
 {
 	return pte_pud(pte_mkspecial(pud_pte(pud)));
 }
-#endif
 
 #ifdef CONFIG_HAVE_ARCH_USERFAULTFD_WP
 static inline bool pmd_uffd_wp(pmd_t pmd)

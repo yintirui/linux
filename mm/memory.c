@@ -628,9 +628,9 @@ static inline bool pgtable_level_has_pxx_special(enum pgtable_level level)
 	case PGTABLE_LEVEL_PTE:
 		return IS_ENABLED(CONFIG_ARCH_HAS_PTE_SPECIAL);
 	case PGTABLE_LEVEL_PMD:
-		return IS_ENABLED(CONFIG_ARCH_SUPPORTS_PMD_PFNMAP);
+		return pgtable_has_pmd_special();
 	case PGTABLE_LEVEL_PUD:
-		return IS_ENABLED(CONFIG_ARCH_SUPPORTS_PUD_PFNMAP);
+		return pgtable_has_pud_special();
 	default:
 		return false;
 	}

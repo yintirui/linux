@@ -312,7 +312,7 @@ static inline int arch_has_pmd_leaves(void)
 	return boot_cpu_has(X86_FEATURE_PSE);
 }
 
-#ifdef CONFIG_ARCH_SUPPORTS_PMD_PFNMAP
+#define __HAVE_ARCH_PMD_SPECIAL
 static inline bool pmd_special(pmd_t pmd)
 {
 	return pmd_flags(pmd) & _PAGE_SPECIAL;
@@ -322,9 +322,8 @@ static inline pmd_t pmd_mkspecial(pmd_t pmd)
 {
 	return pmd_set_flags(pmd, _PAGE_SPECIAL);
 }
-#endif	/* CONFIG_ARCH_SUPPORTS_PMD_PFNMAP */
 
-#ifdef CONFIG_ARCH_SUPPORTS_PUD_PFNMAP
+#define __HAVE_ARCH_PUD_SPECIAL
 static inline bool pud_special(pud_t pud)
 {
 	return pud_flags(pud) & _PAGE_SPECIAL;
@@ -334,7 +333,6 @@ static inline pud_t pud_mkspecial(pud_t pud)
 {
 	return pud_set_flags(pud, _PAGE_SPECIAL);
 }
-#endif	/* CONFIG_ARCH_SUPPORTS_PUD_PFNMAP */
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 
 static inline pte_t pte_set_flags(pte_t pte, pteval_t set)
