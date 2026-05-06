@@ -620,6 +620,11 @@ static inline pmd_t pmd_mkspecial(pmd_t pmd)
 #define pfn_pmd(pfn, prot) \
 	pmd_mkhuge(__pmd(__phys_to_pmd_val((phys_addr_t)(pfn) << PAGE_SHIFT) | \
 			   pgprot_val(prot)))
+#define pfn_pmd_creates_leaf pfn_pmd_creates_leaf
+static inline bool pfn_pmd_creates_leaf(void)
+{
+	return true;
+}
 
 #define pud_young(pud)		pte_young(pud_pte(pud))
 #define pud_mkyoung(pud)	pte_pud(pte_mkyoung(pud_pte(pud)))

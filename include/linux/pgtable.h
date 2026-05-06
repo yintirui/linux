@@ -2321,6 +2321,13 @@ static inline void __init init_arch_has_pmd_leaves(void) { }
 #define arch_has_pmd_leaves() IS_ENABLED(CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE)
 #endif
 
+#ifndef pfn_pmd_creates_leaf
+static inline bool pfn_pmd_creates_leaf(void)
+{
+	return false;
+}
+#endif
+
 #ifndef has_transparent_pud_hugepage
 #define has_transparent_pud_hugepage() IS_BUILTIN(CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD)
 #endif

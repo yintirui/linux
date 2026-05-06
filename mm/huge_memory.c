@@ -1672,7 +1672,7 @@ static vm_fault_t insert_pmd(struct vm_area_struct *vma, unsigned long addr,
 			add_mm_counter(mm, mm_counter_file(fop.folio), HPAGE_PMD_NR);
 		}
 	} else {
-		entry = pmd_mkhuge(pfn_pmd(fop.pfn, prot));
+		entry = pfn_pmd(fop.pfn, prot);
 		entry = pmd_mkspecial(entry);
 	}
 	if (write) {
@@ -1790,7 +1790,7 @@ static vm_fault_t insert_pud(struct vm_area_struct *vma, unsigned long addr,
 		folio_add_file_rmap_pud(fop.folio, &fop.folio->page, vma);
 		add_mm_counter(mm, mm_counter_file(fop.folio), HPAGE_PUD_NR);
 	} else {
-		entry = pud_mkhuge(pfn_pud(fop.pfn, prot));
+		entry = pfn_pud(fop.pfn, prot);
 		entry = pud_mkspecial(entry);
 	}
 	if (write) {
@@ -2501,6 +2501,13 @@ static bool has_deposited_pgtable(struct vm_area_struct *vma, pmd_t pmdval,
 		return !vma_is_dax(vma);
 
 	/*
+	 * Huge PFNMAP PMDs have no normal folio, but still deposit a pgtable
+	 * so later split/teardown paths can withdraw it.
+	 */
+	if (pmd_present(pmdval) && !folio && pmd_special(pmdval))
+		return true;
+
+	/*
 	 * Otherwise, only anonymous folios are deposited, see
 	 * __do_huge_pmd_anonymous_page().
 	 */
@@ -3119,6 +3126,42 @@ static void __split_huge_zero_page_pmd(struct vm_area_struct *vma,
 	pmd_populate(mm, pmd, pgtable);
 }
 
+static void __split_huge_pfnmap_pmd(struct vm_area_struct *vma, unsigned long haddr,
+				    pmd_t *pmd)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	pgtable_t pgtable;
+	pmd_t old_pmd, _pmd;
+	pte_t *pte, entry;
+
+	old_pmd = pmdp_huge_clear_flush(vma, haddr, pmd);
+	pgtable = pgtable_trans_huge_withdraw(mm, pmd);
+	if (WARN_ON_ONCE(!pgtable)) {
+		set_pmd_at(mm, haddr, pmd, old_pmd);
+		return;
+	}
+
+	pmd_populate(mm, &_pmd, pgtable);
+	pte = pte_offset_map(&_pmd, haddr);
+	if (WARN_ON_ONCE(!pte)) {
+		pgtable_trans_huge_deposit(mm, pmd, pgtable);
+		set_pmd_at(mm, haddr, pmd, old_pmd);
+		return;
+	}
+
+	entry = pte_mkspecial(pfn_pte(pmd_pfn(old_pmd), pmd_pgprot(old_pmd)));
+	if (pmd_soft_dirty(old_pmd))
+		entry = pte_mksoft_dirty(entry);
+	if (pmd_uffd_wp(old_pmd))
+		entry = pte_mkuffd_wp(entry);
+
+	set_ptes(mm, haddr, pte, entry, HPAGE_PMD_NR);
+	pte_unmap(pte);
+
+	smp_wmb(); /* make pte visible before pmd */
+	pmd_populate(mm, pmd, pgtable);
+}
+
 static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 		unsigned long haddr, bool freeze)
 {
@@ -3160,10 +3203,7 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 			}
 
 			/* Huge PFNMAP */
-			old_pmd = pmdp_huge_clear_flush(vma, haddr, pmd);
-			if (arch_needs_pgtable_deposit())
-				zap_deposited_table(mm, pmd);
-			return;
+			return __split_huge_pfnmap_pmd(vma, haddr, pmd);
 		}
 
 		/* File/Shmem THP */

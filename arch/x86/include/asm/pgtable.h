@@ -312,6 +312,12 @@ static inline int arch_has_pmd_leaves(void)
 	return boot_cpu_has(X86_FEATURE_PSE);
 }
 
+#define pfn_pmd_creates_leaf pfn_pmd_creates_leaf
+static inline bool pfn_pmd_creates_leaf(void)
+{
+	return true;
+}
+
 #define __HAVE_ARCH_PMD_SPECIAL
 static inline bool pmd_special(pmd_t pmd)
 {

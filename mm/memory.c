@@ -2943,6 +2943,66 @@ static int remap_pte_range(struct mm_struct *mm, pmd_t *pmd,
 	return err;
 }
 
+#ifdef CONFIG_PGTABLE_HAS_HUGE_LEAVES
+static int remap_try_install_pmd_leaf(struct mm_struct *mm, pmd_t *pmd,
+				      unsigned long addr, unsigned long end,
+				      unsigned long pfn, pgprot_t prot)
+{
+	pgtable_t pgtable;
+	/* PMD page table lock. */
+	spinlock_t *ptl;
+	unsigned long i;
+	pmd_t entry;
+
+	if (!pgtable_has_pmd_leaves())
+		return 0;
+
+	if (!pfn_pmd_creates_leaf())
+		return 0;
+
+	if (!pgtable_has_pmd_special())
+		return 0;
+
+	if (!IS_ALIGNED(addr | end, PMD_SIZE))
+		return 0;
+
+	if (!IS_ALIGNED(PFN_PHYS(pfn), PMD_SIZE))
+		return 0;
+
+	for (i = 0; i < PMD_SIZE >> PAGE_SHIFT; i++) {
+		if (!pfn_modify_allowed(pfn + i, prot))
+			return -EACCES;
+	}
+
+	pgtable = pte_alloc_one(mm);
+	if (unlikely(!pgtable))
+		return 0;
+
+	ptl = pmd_lock(mm, pmd);
+	if (!pmd_none(*pmd)) {
+		spin_unlock(ptl);
+		pte_free(mm, pgtable);
+		return 0;
+	}
+
+	entry = pmd_mkspecial(pfn_pmd(pfn, prot));
+	pgtable_trans_huge_deposit(mm, pmd, pgtable);
+	mm_inc_nr_ptes(mm);
+	set_pmd_at(mm, addr, pmd, entry);
+	spin_unlock(ptl);
+
+	return 1;
+}
+#else
+static inline int remap_try_install_pmd_leaf(struct mm_struct *mm, pmd_t *pmd,
+					     unsigned long addr,
+					     unsigned long end,
+					     unsigned long pfn, pgprot_t prot)
+{
+	return 0;
+}
+#endif
+
 static inline int remap_pmd_range(struct mm_struct *mm, pud_t *pud,
 			unsigned long addr, unsigned long end,
 			unsigned long pfn, pgprot_t prot)
@@ -2958,6 +3018,14 @@ static inline int remap_pmd_range(struct mm_struct *mm, pud_t *pud,
 	VM_BUG_ON(pmd_trans_huge(*pmd));
 	do {
 		next = pmd_addr_end(addr, end);
+		err = remap_try_install_pmd_leaf(mm, pmd, addr, next,
+						 pfn + (addr >> PAGE_SHIFT),
+						 prot);
+		if (err < 0)
+			return err;
+		if (err > 0)
+			continue;
+
 		err = remap_pte_range(mm, pmd, addr, next,
 				pfn + (addr >> PAGE_SHIFT), prot);
 		if (err)
