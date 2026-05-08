@@ -67,7 +67,19 @@ static inline pgprot_t pte_pgprot(pte_t pte)
 #define pmd_pgprot pmd_pgprot
 static inline pgprot_t pmd_pgprot(pmd_t pmd)
 {
-	return pte_pgprot(pmd_pte(pmd));
+	pgprot_t prot = pte_pgprot(pmd_pte(pmd));
+
+	/*
+	 * pgprot_t describes protection bits suitable for constructing base
+	 * PTEs.  Hash-64K PMD leaf entries carry H_PAGE_THP_HUGE in addition
+	 * to _PAGE_PTE; the latter is also valid for base PTEs, but the former
+	 * is a huge-PMD-only attribute and must not be propagated into PTEs
+	 * when a huge PFNMAP PMD is split.
+	 */
+#ifdef H_PAGE_THP_HUGE
+	prot = __pgprot(pgprot_val(prot) & ~H_PAGE_THP_HUGE);
+#endif
+	return prot;
 }
 
 #define pud_pgprot pud_pgprot
