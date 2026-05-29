@@ -1886,6 +1886,108 @@ void prep_and_add_allocated_folios(struct hstate *h,
 	spin_unlock_irqrestore(&hugetlb_lock, flags);
 }
 
+static void __init hugetlb_folio_init_tail_vmemmap(struct folio *folio,
+						       struct hstate *h,
+						       unsigned long start_page_number,
+						       unsigned long end_page_number);
+
+static void prep_and_add_allocated_hvo_folios(struct hstate *h,
+					      struct list_head *folio_list)
+{
+	unsigned long flags;
+	struct folio *folio, *tmp_f;
+
+	spin_lock_irqsave(&hugetlb_lock, flags);
+	list_for_each_entry_safe(folio, tmp_f, folio_list, lru) {
+		VM_BUG_ON_FOLIO(!folio_test_hugetlb_vmemmap_optimized(folio), folio);
+		account_new_hugetlb_folio(h, folio);
+		enqueue_hugetlb_folio(h, folio);
+	}
+	spin_unlock_irqrestore(&hugetlb_lock, flags);
+}
+
+static int demote_split_hvo_folio(struct hstate *src, struct hstate *dst,
+				  struct folio *src_folio,
+				  struct list_head *dst_list)
+{
+	unsigned long i;
+	bool cma;
+	int ret;
+
+	VM_BUG_ON_FOLIO(!folio_test_hugetlb(src_folio), src_folio);
+	VM_BUG_ON_FOLIO(folio_ref_count(src_folio), src_folio);
+	VM_BUG_ON_FOLIO(!folio_test_hugetlb_vmemmap_optimized(src_folio), src_folio);
+	VM_BUG_ON(huge_page_order(dst) >= huge_page_order(src));
+	VM_BUG_ON(!hugetlb_vmemmap_optimizable(dst));
+
+	/*
+	 * Convert src-HVO vmemmap layout into dst-order child layouts first.
+	 * This must complete before initializing any dst compound metadata to
+	 * avoid touching shared tail vmemmap pages.
+	 */
+	ret = hugetlb_vmemmap_relayout_demote_folio(src, dst, src_folio);
+	if (ret)
+		return ret;
+
+	cma = folio_test_hugetlb_cma(src_folio);
+
+	split_page_owner(&src_folio->page, huge_page_order(src),
+			  huge_page_order(dst));
+	pgalloc_tag_split(src_folio, huge_page_order(src), huge_page_order(dst));
+
+	for (i = 0; i < pages_per_huge_page(src); i += pages_per_huge_page(dst)) {
+		struct folio *dst_folio = (struct folio *)folio_page(src_folio, i);
+		struct page *head = &dst_folio->page;
+
+		/* dst_folio is not an initialized hugetlb folio yet. */
+		VM_BUG_ON_FOLIO(folio_ref_count(dst_folio), dst_folio);
+
+		clear_compound_head(head);
+		if (HUGETLB_VMEMMAP_RESERVE_PAGES > 1)
+			hugetlb_folio_init_tail_vmemmap(dst_folio, dst, 1,
+					HUGETLB_VMEMMAP_RESERVE_PAGES);
+		prep_compound_head(head, huge_page_order(dst));
+
+		dst_folio->mapping = NULL;
+		init_new_hugetlb_folio(dst_folio);
+
+		/* After successful relayout, each dst child vmemmap is HVO. */
+		folio_set_hugetlb_vmemmap_optimized(dst_folio);
+		VM_BUG_ON_FOLIO(!folio_test_hugetlb_vmemmap_optimized(dst_folio),
+					dst_folio);
+
+		if (cma)
+			folio_set_hugetlb_cma(dst_folio);
+		list_add(&dst_folio->lru, dst_list);
+	}
+
+	return 0;
+}
+
+static bool demote_hvo_fastpath_eligible(struct hstate *src, struct hstate *dst,
+					 struct folio *folio)
+{
+	if (!folio_test_hugetlb_vmemmap_optimized(folio))
+		return false;
+
+	if (!hugetlb_vmemmap_optimizable(src) ||
+	    !hugetlb_vmemmap_optimizable(dst))
+		return false;
+
+	if (huge_page_order(dst) >= huge_page_order(src))
+		return false;
+
+	/* dst children must fully tile src without partial overlap */
+	if (pages_per_huge_page(src) % pages_per_huge_page(dst))
+		return false;
+	if (hugetlb_vmemmap_size(src) % hugetlb_vmemmap_size(dst))
+		return false;
+	if (hugetlb_vmemmap_size(dst) % PAGE_SIZE)
+		return false;
+
+	return true;
+}
+
 /*
  * Allocates a fresh hugetlb page in a node interleaved manner.  The page
  * will later be added to the appropriate hugetlb pool.
@@ -3111,7 +3213,7 @@ found:
 }
 
 /* Initialize [start_page:end_page_number] tail struct pages of a hugepage */
-static void __init hugetlb_folio_init_tail_vmemmap(struct folio *folio,
+static void hugetlb_folio_init_tail_vmemmap(struct folio *folio,
 					struct hstate *h,
 					unsigned long start_page_number,
 					unsigned long end_page_number)
@@ -3915,10 +4017,17 @@ out:
 static long demote_free_hugetlb_folios(struct hstate *src, struct hstate *dst,
 				       struct list_head *src_list)
 {
-	long rc;
+	long rc = 0;
 	struct folio *folio, *next;
 	LIST_HEAD(dst_list);
+	LIST_HEAD(dst_hvo_list);
+	LIST_HEAD(hvo_src_list);
 	LIST_HEAD(ret_list);
+
+	list_for_each_entry_safe(folio, next, src_list, lru) {
+		if (demote_hvo_fastpath_eligible(src, dst, folio))
+			list_move(&folio->lru, &hvo_src_list);
+	}
 
 	rc = hugetlb_vmemmap_restore_folios(src, src_list, &ret_list);
 	list_splice_init(&ret_list, src_list);
@@ -3933,12 +4042,20 @@ static long demote_free_hugetlb_folios(struct hstate *src, struct hstate *dst,
 	 */
 	mutex_lock(&dst->resize_lock);
 
+	list_for_each_entry_safe(folio, next, &hvo_src_list, lru) {
+		list_del(&folio->lru);
+
+		rc = demote_split_hvo_folio(src, dst, folio, &dst_hvo_list);
+		if (rc) {
+			list_add(&folio->lru, src_list);
+			list_splice_init(&hvo_src_list, src_list);
+			goto out_add;
+		}
+	}
+
 	list_for_each_entry_safe(folio, next, src_list, lru) {
 		int i;
 		bool cma;
-
-		if (folio_test_hugetlb_vmemmap_optimized(folio))
-			continue;
 
 		cma = folio_test_hugetlb_cma(folio);
 
@@ -3964,6 +4081,8 @@ static long demote_free_hugetlb_folios(struct hstate *src, struct hstate *dst,
 		}
 	}
 
+out_add:
+	prep_and_add_allocated_hvo_folios(dst, &dst_hvo_list);
 	prep_and_add_allocated_folios(dst, &dst_list);
 
 	mutex_unlock(&dst->resize_lock);

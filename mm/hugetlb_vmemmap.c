@@ -42,11 +42,22 @@ struct vmemmap_remap_walk {
 	struct page		*vmemmap_tail;
 	struct list_head	*vmemmap_pages;
 
+	/*
+	 * Fields used by remap-only callbacks (e.g. hugetlb demote
+	 * relayout). They are ignored by vmemmap_remap_free/alloc paths.
+	 */
+	unsigned long		vmemmap_start;
+	unsigned int		dst_child_pte_stride;
+	unsigned int		nr_dst_children;
+	struct page		**dst_child_heads; /* [nr_dst_children - 1], child=1..N-1 */
+	struct page		*dst_tail;
 
 /* Skip the TLB flush when we split the PMD */
 #define VMEMMAP_SPLIT_NO_TLB_FLUSH	BIT(0)
 /* Skip the TLB flush when we remap the PTE */
 #define VMEMMAP_REMAP_NO_TLB_FLUSH	BIT(1)
+/* Remap head PTEs for all dst children, not only the first one */
+#define VMEMMAP_REMAP_ALL_PTES	BIT(2)
 	unsigned long		flags;
 };
 
@@ -227,6 +238,71 @@ static void vmemmap_remap_pte(pte_t *pte, unsigned long addr,
 
 	list_add(&page->lru, walk->vmemmap_pages);
 	set_pte_at(&init_mm, addr, pte, entry);
+}
+
+static void vmemmap_remap_demote_pte_only(pte_t *pte, unsigned long addr,
+					   struct vmemmap_remap_walk *walk)
+{
+	pte_t entry;
+	unsigned long pte_idx, pte_in_child;
+	unsigned int child_idx;
+	struct page *old_page = pte_page(ptep_get(pte));
+
+	/*
+	 * Without VMEMMAP_REMAP_ALL_PTES, only the first PTE in the range is
+	 * treated as head; all other PTEs are mapped to tail. Demoting a
+	 * source HVO vmemmap requires remapping every child head PTE.
+	 */
+	if (!(walk->flags & VMEMMAP_REMAP_ALL_PTES)) {
+		if (walk->nr_walked == 0)
+			entry = mk_pte(old_page, PAGE_KERNEL);
+		else
+			entry = mk_pte(walk->dst_tail, PAGE_KERNEL_RO);
+		goto set_pte;
+	}
+
+	pte_idx = (addr - walk->vmemmap_start) >> PAGE_SHIFT;
+	pte_in_child = pte_idx % walk->dst_child_pte_stride;
+	child_idx = pte_idx / walk->dst_child_pte_stride;
+
+	/*
+	 * PTEs of each dst child are laid out as:
+	 *   [0] head(vmemmap reserve page), [1..] tail(shared RO vmemmap pages)
+	 */
+	if (pte_in_child == 0) {
+		if (child_idx == 0) {
+			/* Reuse the src head page for the first child */
+			entry = mk_pte(old_page, PAGE_KERNEL);
+		} else {
+			/* Child=1..N-1 uses newly allocated head pages */
+			entry = mk_pte(walk->dst_child_heads[child_idx - 1], PAGE_KERNEL);
+		}
+	} else {
+		entry = mk_pte(walk->dst_tail, PAGE_KERNEL_RO);
+	}
+
+set_pte:
+	set_pte_at(&init_mm, addr, pte, entry);
+}
+
+static int vmemmap_remap_demote_only(unsigned long start, unsigned long end,
+				      unsigned int nr_dst_children,
+				      unsigned int dst_child_pte_stride,
+				      struct page **dst_child_heads,
+				      struct page *dst_tail,
+				      unsigned long flags)
+{
+	struct vmemmap_remap_walk walk = {
+		.remap_pte		= vmemmap_remap_demote_pte_only,
+		.vmemmap_start		= start,
+		.dst_child_pte_stride	= dst_child_pte_stride,
+		.nr_dst_children	= nr_dst_children,
+		.dst_child_heads	= dst_child_heads,
+		.dst_tail		= dst_tail,
+		.flags			= flags,
+	};
+
+	return vmemmap_remap_range(start, end, &walk);
 }
 
 static void vmemmap_restore_pte(pte_t *pte, unsigned long addr,
@@ -596,6 +672,112 @@ void hugetlb_vmemmap_optimize_folio(const struct hstate *h, struct folio *folio)
 
 	__hugetlb_vmemmap_optimize_folio(h, folio, &vmemmap_pages, 0);
 	free_vmemmap_page_list(&vmemmap_pages);
+}
+
+/**
+ * hugetlb_vmemmap_relayout_demote_folio - convert one src-HVO vmemmap layout
+ * into multiple dst-order HVO layouts for all demoted children.
+ *
+ * The caller should only initialize dst child reserve/head pages after this
+ * relayout succeeds.
+ *
+ * Return: %0 on success, negative error code otherwise.
+ */
+int hugetlb_vmemmap_relayout_demote_folio(const struct hstate *src,
+					  const struct hstate *dst,
+					  struct folio *src_folio)
+{
+	unsigned long vmemmap_src_start, vmemmap_src_end;
+	unsigned long dst_vmemmap_size;
+	unsigned long nr_dst_children;
+	unsigned int dst_child_pte_stride;
+	struct page *dst_tail;
+	struct page **dst_child_heads;
+	unsigned long i;
+	int nid, ret;
+
+	VM_BUG_ON_FOLIO(!folio_test_hugetlb(src_folio), src_folio);
+	VM_BUG_ON_FOLIO(folio_ref_count(src_folio), src_folio);
+	VM_BUG_ON_FOLIO(!folio_test_hugetlb_vmemmap_optimized(src_folio),
+			src_folio);
+
+	VM_BUG_ON(huge_page_order((struct hstate *)dst) >=
+		  huge_page_order((struct hstate *)src));
+	VM_BUG_ON(!hugetlb_vmemmap_optimizable(dst));
+
+	nid = folio_nid(src_folio);
+	nr_dst_children = pages_per_huge_page(src) / pages_per_huge_page(dst);
+	VM_BUG_ON(nr_dst_children < 2);
+
+	vmemmap_src_start = (unsigned long)&src_folio->page;
+	vmemmap_src_end = vmemmap_src_start + hugetlb_vmemmap_size(src);
+	dst_vmemmap_size = hugetlb_vmemmap_size(dst);
+
+	VM_BUG_ON(dst_vmemmap_size % PAGE_SIZE);
+	VM_BUG_ON(vmemmap_src_end - vmemmap_src_start !=
+		  nr_dst_children * dst_vmemmap_size);
+	VM_BUG_ON(vmemmap_src_start % dst_vmemmap_size);
+
+	dst_child_pte_stride = dst_vmemmap_size / PAGE_SIZE;
+	dst_tail = vmemmap_get_tail(dst->order, folio_zone(src_folio));
+	if (!dst_tail)
+		return -ENOMEM;
+
+	/*
+	 * Reuse src's existing head vmemmap page for the first dst child.
+	 * Only allocate head pages for children [1..nr_dst_children-1].
+	 */
+	dst_child_heads = kcalloc(nr_dst_children - 1, sizeof(*dst_child_heads),
+				    GFP_KERNEL);
+	if (!dst_child_heads)
+		return -ENOMEM;
+
+	for (i = 1; i < nr_dst_children; i++) {
+		struct page *head;
+		unsigned long child_start;
+
+		head = alloc_pages_node(nid, GFP_KERNEL, 0);
+		if (!head) {
+			ret = -ENOMEM;
+			goto out_free_heads;
+		}
+
+		child_start = vmemmap_src_start + i * dst_vmemmap_size;
+		copy_page(page_to_virt(head), (void *)child_start);
+
+		dst_child_heads[i - 1] = head;
+		memmap_pages_add(1);
+	}
+
+	/* Ensure vmemmap_head contents are visible before installing PTEs */
+	smp_wmb();
+
+	ret = vmemmap_remap_split(vmemmap_src_start, vmemmap_src_end);
+	if (ret)
+		goto out_free_heads;
+
+	ret = vmemmap_remap_demote_only(vmemmap_src_start, vmemmap_src_end,
+					 nr_dst_children, dst_child_pte_stride,
+					 dst_child_heads, dst_tail,
+					 VMEMMAP_REMAP_ALL_PTES);
+	/*
+	 * vmemmap_remap_demote_only() should be non-failing after successful
+	 * vmemmap_remap_split(), since it doesn't allocate memory.
+	 */
+	if (ret) {
+		kfree(dst_child_heads);
+		return ret;
+	}
+
+	kfree(dst_child_heads);
+	return 0;
+
+out_free_heads:
+	for (i = 1; i < nr_dst_children; i++)
+		if (dst_child_heads[i - 1])
+			free_vmemmap_page(dst_child_heads[i - 1]);
+	kfree(dst_child_heads);
+	return ret;
 }
 
 static int hugetlb_vmemmap_split_folio(const struct hstate *h, struct folio *folio)
